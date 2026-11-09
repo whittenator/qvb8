@@ -2,6 +2,7 @@
 # Terminal chat with Ripple-65B (same engine as the server, runs in the foreground).
 #   MODEL=... DRAFT=... scripts/ripple_chat.sh                                # interactive
 #   MODEL=... DRAFT=... scripts/ripple_chat.sh "Explain entropy" --no-interactive
+#   QV_PIPELINE_SPLIT=auto MODEL=... DRAFT=... scripts/ripple_chat.sh         # two GPUs, see the README
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 : "${MODEL:?set MODEL to the target pack dir (qvb8 or qvb8r)}"
 : "${DRAFT:?set DRAFT to the DFlash2 drafter pack dir}"

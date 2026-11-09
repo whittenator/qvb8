@@ -4,6 +4,7 @@
 #     scripts/ripple_server.sh [start|stop|status|restart|log] [extra serve flags]
 #   port 8080. Log: scripts/logs/Ripple-65B.log.  Extra flags come last, so they win (e.g. --no-think).
 # Env: MODEL, DRAFT (required for start), PORT, PYTHON (default: python)
+# Two GPUs: QV_PIPELINE_SPLIT=auto (or a layer count) splits the layers over two cards, see the README.
 
 NAME=Ripple-65B; DEF_PORT=8080
 launch() {

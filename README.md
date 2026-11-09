@@ -42,6 +42,7 @@ identical to the original's, or correct. See the disclaimer at the end of this f
 ## Requirements
 
 - An NVIDIA GPU with about 62 GB of GPU memory for the qvb8 1e-3 pack (about 50 GB for the qvb8r 1e-3 pack), and the CUDA toolkit with `nvcc`.
+  Two smaller cards can share one pack: see [Two GPUs](#two-gpus-pipeline-placement).
 - **Provided build:** NVIDIA DGX Spark (GB10, sm_121, aarch64), Ubuntu 24.04, driver 580, CUDA 13.0, Python 3.12, PyTorch 2.14.
   This is the build that has been tested.
 - **Other GPUs:** the source is not tied to one GPU. The kernels compile for your GPU on first use (for example sm_120 on an
@@ -138,6 +139,35 @@ as sent by Cline and similar clients.
 MODEL=... DRAFT=... scripts/ripple_chat.sh                                 # interactive
 MODEL=... DRAFT=... scripts/ripple_chat.sh "Explain entropy" --no-interactive
 ```
+
+## Two GPUs (pipeline placement)
+
+A pack that is too big for one card can be split over two cards in one process: the first decoder layers live on
+one card, the rest (plus the embedding, the lm_head and the drafter) on the other, and the hidden state crosses once
+per forward pass. Set `QV_PIPELINE_SPLIT`; the same variables work for `scripts/ripple_chat.sh`.
+
+```bash
+export MODEL=./models/Ripple-65B-Preview-QVB8-1e-3
+export DRAFT=./models/Ripple-65B-Preview-DFlash2-QVB8-5e-3
+QV_PIPELINE_SPLIT=auto scripts/ripple_server.sh
+```
+
+- `QV_PIPELINE_SPLIT=auto` balances the two cards from the pack's per-layer sizes and each card's free memory. A number
+  `k` puts layers `0..k-1` on the first card instead. For the qvb8 1e-3 pack on two 48 GB cards, `auto` picks 45 of the
+  80 layers: about 32 GB of weights per card.
+- `QV_PIPELINE_FIRST` (default: the other card, `cuda:1`) is the card of the first layers. The main card is the one
+  `--device auto` resolves to, `cuda:0`; use `CUDA_VISIBLE_DEVICES` to choose which two cards are used.
+- `QV_PIPELINE_MAIN_RESERVE_GB` (default 6) is what `auto` keeps aside on the main card for the drafter and the request
+  tensors.
+- The load log prints the split and what each card holds (`>>> pipeline: ...`); `scripts/ripple_server.sh status`
+  shows both cards.
+- Requests are served one at a time in this mode (the continuous-batching scheduler needs one card), and
+  `--max-memory-gb` does not cap each card: a card that runs out of memory fails the request.
+- Each KV-cache layer lives on its layer's card, so a long context grows on both cards.
+
+**Status: not tested for Ripple.** Pipeline placement was developed on 2x V100 with the Qwen 27B. The Ripple path uses
+the same loader and layer hooks, but it has not been run on two cards, so check a few answers against a single-card
+run or the reference model before you rely on it.
 
 ## Supported options
 

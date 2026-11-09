@@ -360,6 +360,83 @@ def _install_pipeline_hooks(model, place) -> int:
     return n
 
 
+def _balance_split(weights, main_extra, free_first, free_main) -> int:
+    """The k in 1..len(weights)-1 that fills the two cards most evenly.
+
+    Layers [0, k) go to the first card, layers [k, L) plus `main_extra` to the
+    main one; "evenly" is the smaller of the two worst fill fractions
+    (bytes placed / bytes free), so unequal or partly used cards are handled
+    by the same rule."""
+    total = sum(weights)
+    best_k, best, first = 1, None, 0
+    for k in range(1, len(weights)):
+        first += weights[k - 1]
+        worst = max(first / max(free_first, 1), (total - first + main_extra) / max(free_main, 1))
+        if best is None or worst < best:
+            best_k, best = k, worst
+    return best_k
+
+
+def _auto_pipeline_split(args, first: str, main: str) -> int:
+    """QV_PIPELINE_SPLIT=auto: the split layer from the pack's per-layer sizes.
+
+    A packed weight takes about its pack-file size in VRAM, so the manifest
+    gives each layer's cost before anything is loaded. The main card also
+    holds what is not a decoder layer (embedding, lm_head) and what the loader
+    cannot see: the drafter and the request tensors. QV_PIPELINE_MAIN_RESERVE_GB
+    (default 6) stands for those. A dense checkpoint has no manifest: its
+    layers are counted as equal and split by the cards' free memory alone."""
+    import re
+    layer_re = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+    per: dict[int, int] = {}
+    extra = 0
+    pack_dir = None if args.no_compress else args.pack_dir
+    if pack_dir:
+        tensors = json.load(open(os.path.join(pack_dir, "manifest.json")))["tensors"]
+        for key, info in tensors.items():
+            n = info.get("bytes")
+            if not n:
+                try:
+                    n = os.path.getsize(os.path.join(pack_dir, info["pack"]))
+                except OSError:
+                    n = 0
+            m = layer_re.search(key)
+            if m:
+                per[int(m.group(1))] = per.get(int(m.group(1)), 0) + n
+            else:
+                extra += n
+    sized = bool(per) and sum(per.values()) > 0
+    if sized:
+        weights = [per.get(i, 0) for i in range(max(per) + 1)]
+        extra += int(float(os.environ.get("QV_PIPELINE_MAIN_RESERVE_GB", "6")) * 1e9)
+    else:
+        cfg = json.load(open(os.path.join(args.model, "config.json")))
+        n_layers = (cfg.get("text_config") or cfg).get("num_hidden_layers")
+        if not n_layers:
+            raise RuntimeError("QV_PIPELINE_SPLIT=auto: no per-layer sizes and no num_hidden_layers "
+                               "in config.json; give the split layer as a number")
+        weights, extra = [1] * int(n_layers), 0
+    if len(weights) < 2:
+        raise RuntimeError("QV_PIPELINE_SPLIT=auto: the model has fewer than two decoder layers")
+    free_first = torch.cuda.mem_get_info(torch.device(first))[0]
+    free_main = torch.cuda.mem_get_info(torch.device(main))[0]
+    k = _balance_split(weights, extra, free_first, free_main)
+    if sized:
+        b_first, b_main = sum(weights[:k]), sum(weights[k:]) + extra
+        print(f">>> pipeline auto split at layer {k} of {len(weights)}: about "
+              f"{b_first / 1e9:.1f} GB on {first} ({free_first / 1e9:.1f} GB free), "
+              f"{b_main / 1e9:.1f} GB on {main} ({free_main / 1e9:.1f} GB free, "
+              f"drafter reserve included)", flush=True)
+        if b_first > free_first or b_main > free_main:
+            print("WARNING: the pack does not fit the two cards' free memory by this estimate; "
+                  "use a smaller pack (qvb8r, or a larger tau)", flush=True)
+    else:
+        print(f">>> pipeline auto split at layer {k} of {len(weights)} (no per-layer sizes: "
+              f"by free memory, {free_first / 1e9:.1f} GB on {first}, "
+              f"{free_main / 1e9:.1f} GB on {main})", flush=True)
+    return k
+
+
 _HOST_EMBED_MIN_ROWS = 65536
 _HOST_EMBED_ENABLED = os.environ.get("QV_HOST_EMBED", "0") == "1"
 
@@ -473,21 +550,44 @@ def _load_qv_model_impl(args):
     # step is CPU-bound), no ranks to keep in lockstep, and the first card
     # holds weights only. _install_pipeline_hooks moves each layer's inputs
     # to its card and makes that card current while it runs.
+    #
+    # QV_PIPELINE_SPLIT=auto picks k from the pack's own per-layer sizes and
+    # the free memory of the two cards (_auto_pipeline_split). QV_PIPELINE_FIRST
+    # unset: the lowest-numbered visible card that is not the main one, so a
+    # plain `--device auto` launch (main = cuda:0) puts the first layers on cuda:1.
     main_device = device
-    pipe_split = int(os.environ.get("QV_PIPELINE_SPLIT", "0") or 0)
+    _split_env = (os.environ.get("QV_PIPELINE_SPLIT", "0") or "0").strip().lower()
+    pipe_auto = _split_env == "auto"
+    if not pipe_auto and not _split_env.isdigit():
+        raise RuntimeError(f"QV_PIPELINE_SPLIT={_split_env!r}: expected a layer count or 'auto'")
+    pipe_split = 0 if pipe_auto else int(_split_env)
     pipe_first = None
-    if pipe_split > 0:
+    if pipe_auto or pipe_split > 0:
         if tp_enabled:
             raise RuntimeError("QV_PIPELINE_SPLIT is for a single-process launch, not torchrun")
-        pipe_first = os.environ.get("QV_PIPELINE_FIRST", "cuda:0")
+        if backend is not torch.cuda:
+            raise RuntimeError("QV_PIPELINE_SPLIT needs CUDA devices")
         _md = torch.device(main_device)
         if _md.index is None:                  # "cuda" -> the current card, explicitly
             main_device = device = f"{_md.type}:{backend.current_device()}"
+        pipe_first = os.environ.get("QV_PIPELINE_FIRST", "").strip()
+        if not pipe_first:
+            _others = [i for i in range(torch.cuda.device_count())
+                       if i != torch.device(main_device).index]
+            if not _others:
+                raise RuntimeError("QV_PIPELINE_SPLIT needs two CUDA devices, only one is visible "
+                                   "(check CUDA_VISIBLE_DEVICES)")
+            pipe_first = f"cuda:{_others[0]}"
         if torch.device(pipe_first) == torch.device(main_device):
             raise RuntimeError(f"QV_PIPELINE_FIRST={pipe_first} is the main device too; "
-                               f"pass --device for the OTHER card")
-        if backend is torch.cuda:
-            torch.cuda.set_device(torch.device(main_device))
+                               f"set QV_PIPELINE_FIRST to the OTHER card")
+        if pipe_auto:
+            pipe_split = _auto_pipeline_split(args, pipe_first, main_device)
+        # The decode engine and the server read these two as well (spec_decode,
+        # llm_server): hand them the resolved values, never "auto" / unset.
+        os.environ["QV_PIPELINE_SPLIT"] = str(pipe_split)
+        os.environ["QV_PIPELINE_FIRST"] = pipe_first
+        torch.cuda.set_device(torch.device(main_device))
         print(f">>> pipeline: layers 0..{pipe_split - 1} on {pipe_first}, "
               f"layers {pipe_split}.. + embed/norm/lm_head on {main_device}", flush=True)
 
@@ -1052,6 +1152,12 @@ def _load_qv_model_impl(args):
 
     gc.collect()
     backend.empty_cache()
+    if pipe_first is not None:
+        # What each card holds after load: the number to tune QV_PIPELINE_SPLIT by.
+        for _d in (pipe_first, main_device):
+            _free, _total = torch.cuda.mem_get_info(torch.device(_d))
+            print(f">>> pipeline: {_d} holds {torch.cuda.memory_allocated(torch.device(_d)) / 1e9:.1f} GB "
+                  f"of weights, {_free / 1e9:.1f} of {_total / 1e9:.1f} GB free", flush=True)
     if nemotron:
         model._qv_nemotron = True
         model._qv_eos_ids = _nemotron_eos_ids(args.model, config, tok)
